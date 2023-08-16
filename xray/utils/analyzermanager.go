@@ -12,21 +12,22 @@ import (
 	"github.com/owenrumney/go-sarif/v2/sarif"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
 )
 
 var (
-	analyzerManagerLogFolder = ""
-	levelToSeverity          = map[string]string{"error": "High", "warning": "Medium", "info": "Low"}
+	levelToSeverity = map[string]string{"error": "High", "warning": "Medium", "info": "Low"}
 )
 
 const (
 	EntitlementsMinVersion        = "3.66.5"
 	ApplicabilityFeatureId        = "contextual_analysis"
 	AnalyzerManagerZipName        = "analyzerManager.zip"
-	analyzerManagerDownloadPath   = "xsc-gen-exe-analyzer-manager-local/v1/[RELEASE]"
+	analyzerManagerVersion        = "1.2.4.1921744"
+	analyzerManagerDownloadPath   = "xsc-gen-exe-analyzer-manager-local/v1"
 	analyzerManagerDirName        = "analyzerManager"
 	analyzerManagerExecutableName = "analyzerManager"
 	analyzerManagerLogDirName     = "analyzerManagerLogs"
@@ -38,6 +39,8 @@ const (
 	SeverityDefaultValue          = "Medium"
 	notEntitledExitCode           = 31
 	unsupportedCommandExitCode    = 13
+	unsupportedOsExitCode         = 55
+	ErrFailedScannerRun           = "failed to run %s scan. Exit code received: %s"
 )
 
 const (
@@ -45,6 +48,27 @@ const (
 	NotApplicableStringValue             = "Not Applicable"
 	ApplicabilityUndeterminedStringValue = "Undetermined"
 )
+
+type ScanType string
+
+const (
+	Applicability ScanType = "Applicability"
+	Secrets       ScanType = "Secrets"
+	IaC           ScanType = "IaC"
+)
+
+func (st ScanType) FormattedError(err error) error {
+	if err != nil {
+		return fmt.Errorf(ErrFailedScannerRun, st, err.Error())
+	}
+	return nil
+}
+
+var exitCodeErrorsMap = map[int]string{
+	notEntitledExitCode:        "got not entitled error from analyzer manager",
+	unsupportedCommandExitCode: "got unsupported scan command error from analyzer manager",
+	unsupportedOsExitCode:      "got unsupported operating system error from analyzer manager",
+}
 
 type IacOrSecretResult struct {
 	Severity   string
@@ -56,6 +80,7 @@ type IacOrSecretResult struct {
 
 type ExtendedScanResults struct {
 	XrayResults                  []services.ScanResponse
+	ScannedTechnologies          []coreutils.Technology
 	ApplicabilityScanResults     map[string]string
 	SecretsScanResults           []IacOrSecretResult
 	IacScanResults               []IacOrSecretResult
@@ -79,7 +104,7 @@ func (e *ExtendedScanResults) getXrayScanResults() []services.ScanResponse {
 //   - sarif file containing the scan results
 type AnalyzerManagerInterface interface {
 	ExistLocally() (bool, error)
-	Exec(string, string) error
+	Exec(string, string, *config.ServerDetails) error
 }
 
 type AnalyzerManager struct {
@@ -95,7 +120,10 @@ func (am *AnalyzerManager) ExistLocally() (bool, error) {
 	return fileutils.IsFileExists(analyzerManagerPath, false)
 }
 
-func (am *AnalyzerManager) Exec(configFile string, scanCommand string) (err error) {
+func (am *AnalyzerManager) Exec(configFile, scanCommand string, serverDetails *config.ServerDetails) (err error) {
+	if err = SetAnalyzerManagerEnvVariables(serverDetails); err != nil {
+		return err
+	}
 	cmd := exec.Command(am.analyzerManagerFullPath, scanCommand, configFile)
 	defer func() {
 		if !cmd.ProcessState.Exited() {
@@ -109,21 +137,12 @@ func (am *AnalyzerManager) Exec(configFile string, scanCommand string) (err erro
 	return errorutils.CheckError(err)
 }
 
-func CreateAnalyzerManagerLogDir() error {
-	logDir, err := coreutils.CreateDirInJfrogHome(filepath.Join(coreutils.JfrogLogsDirName, analyzerManagerLogDirName))
-	if err != nil {
-		return err
-	}
-	analyzerManagerLogFolder = logDir
-	return nil
-}
-
 func GetAnalyzerManagerDownloadPath() (string, error) {
 	osAndArc, err := coreutils.GetOSAndArc()
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("%s/%s/%s", analyzerManagerDownloadPath, osAndArc, AnalyzerManagerZipName), nil
+	return path.Join(analyzerManagerDownloadPath, analyzerManagerVersion, osAndArc, AnalyzerManagerZipName), nil
 }
 
 func GetAnalyzerManagerDirAbsolutePath() (string, error) {
@@ -166,34 +185,26 @@ func SetAnalyzerManagerEnvVariables(serverDetails *config.ServerDetails) error {
 	if err := os.Setenv(jfTokenEnvVariable, serverDetails.AccessToken); errorutils.CheckError(err) != nil {
 		return err
 	}
-	if err := os.Setenv(logDirEnvVariable, analyzerManagerLogFolder); errorutils.CheckError(err) != nil {
+	analyzerManagerLogFolder, err := coreutils.CreateDirInJfrogHome(filepath.Join(coreutils.JfrogLogsDirName, analyzerManagerLogDirName))
+	if err != nil {
+		return err
+	}
+	if err = os.Setenv(logDirEnvVariable, analyzerManagerLogFolder); errorutils.CheckError(err) != nil {
 		return err
 	}
 	return nil
 }
 
-func IsNotEntitledError(err error) bool {
-	if exitError, ok := err.(*exec.ExitError); ok {
+func ParseAnalyzerManagerError(scanner ScanType, err error) error {
+	var exitError *exec.ExitError
+	if errors.As(err, &exitError) {
 		exitCode := exitError.ExitCode()
-		// User not entitled error
-		if exitCode == notEntitledExitCode {
-			log.Debug("got not entitled error from analyzer manager")
-			return true
+		if exitCodeDescription, exitCodeExists := exitCodeErrorsMap[exitCode]; exitCodeExists {
+			log.Warn(exitCodeDescription)
+			return nil
 		}
 	}
-	return false
-}
-
-func IsUnsupportedCommandError(err error) bool {
-	if exitError, ok := err.(*exec.ExitError); ok {
-		exitCode := exitError.ExitCode()
-		// Analyzer manager doesn't support the requested scan command
-		if exitCode == unsupportedCommandExitCode {
-			log.Debug("got unsupported scan command error from analyzer manager")
-			return true
-		}
-	}
-	return false
+	return scanner.FormattedError(err)
 }
 
 func RemoveDuplicateValues(stringSlice []string) []string {
@@ -242,4 +253,25 @@ func GetResultSeverity(result *sarif.Result) string {
 		}
 	}
 	return SeverityDefaultValue
+}
+
+// Receives a list of relative path working dirs, returns a list of full paths working dirs
+func GetFullPathsWorkingDirs(workingDirs []string) ([]string, error) {
+	if len(workingDirs) == 0 {
+		currentDir, err := coreutils.GetWorkingDirectory()
+		if err != nil {
+			return nil, err
+		}
+		return []string{currentDir}, nil
+	}
+
+	var fullPathsWorkingDirs []string
+	for _, wd := range workingDirs {
+		fullPathWd, err := filepath.Abs(wd)
+		if err != nil {
+			return nil, err
+		}
+		fullPathsWorkingDirs = append(fullPathsWorkingDirs, fullPathWd)
+	}
+	return fullPathsWorkingDirs, nil
 }
